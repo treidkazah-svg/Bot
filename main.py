@@ -2,7 +2,6 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
 import ccxt
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -23,18 +22,12 @@ TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 SYMBOL = "XAU/USD"
 TIMEFRAME = "15m"
-
 DEPOSIT = 100
 LEVERAGE = 10
 TARGET_PROFIT = 50
 POSITION_SIZE = DEPOSIT * LEVERAGE
 
-# --- МІНЕ, ТҮЗЕТІЛДІ: Binance емес, Bybit ---
-exchange = ccxt.bybit({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
-
+exchange = ccxt.kraken({'enableRateLimit': True})
 active_trade = {"direction": None, "entry": 0, "tp": 0, "be_warned": False}
 
 def get_candles(limit=100):
@@ -112,13 +105,8 @@ def calc_tp(entry, direction):
     return entry * (1 + p) if direction == "LONG" else entry * (1 - p)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "SMC + Orderflow бот қосылды! 📈\n\n"
-        "90%+ болса ғана сигнал\nТейк = 50$\nҚарсы жүрсе БУ-ге жап деп ескертем\n\n"
-        "Тексеру: /check"
-    )
+    await update.message.reply_text("SMC + Orderflow бот қосылды! 📈\n90%+ болса сигнал\nТейк = 50$\nҚарсы жүрсе БУ-ге жап деп ескертем\nТексеру: /check")
 
-# --- МІНЕ, /check ТҮЗЕТІЛДІ: қате болса да жауап береді ---
 async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Тексеріп жатырмын... ⏳")
@@ -131,8 +119,7 @@ async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"⚪ Сигнал жоқ\n\nУверенность: {conf}% (керек 90%+)\nБаға: {price}\n\nSMC: {smc_text}\nOF: {of_text}"
         await update.message.reply_text(msg)
     except Exception as e:
-        # Егер биржа тағы қосылмаса, бот үндемей қалмайды, қатені айтады
-        await update.message.reply_text(f"Қате шықты: {e}\nBybit-ке қосыла алмай тұр. 1 минуттан соң қайталап көр.")
+        await update.message.reply_text(f"Қате: {e}")
 
 def signal_loop(app):
     import asyncio
@@ -158,7 +145,7 @@ def signal_loop(app):
                 elif not active_trade["be_warned"]:
                     pnl = (price - entry) / entry * 100 if d == "LONG" else (entry - price) / entry * 100
                     if pnl <= -0.3:
-                        text = f"⚠️ БУ-ГЕ ЖАП!\n\n{d} | Кіру: {entry}\nҚазір: {price} ({pnl:.2f}%)\nБаға қарсы кетті! Стопты кіру нүктесіне қой!"
+                        text = f"⚠️ БУ-ГЕ ЖАП!\n\n{d} | Кіру: {entry}\nҚазір: {price} ({pnl:.2f}%)\nБаға қарсы кетті!"
                         if CHAT_ID:
                             asyncio.run_coroutine_threadsafe(app.bot.send_message(chat_id=int(CHAT_ID), text=text), asyncio.get_event_loop())
                         active_trade.update({"direction": None, "entry": 0, "tp": 0, "be_warned": False})
