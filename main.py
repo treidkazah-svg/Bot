@@ -20,7 +20,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-SYMBOL = "XAU/USDT"  # АЛТЫН
+SYMBOL = "XAUT/USDT"  # АЛТЫН
 TIMEFRAME = "15m"
 DEPOSIT = 100
 LEVERAGE = 10
