@@ -20,14 +20,15 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-SYMBOL = "XAU/USD"
+SYMBOL = "XAU/USDT"  # АЛТЫН
 TIMEFRAME = "15m"
 DEPOSIT = 100
 LEVERAGE = 10
 TARGET_PROFIT = 50
 POSITION_SIZE = DEPOSIT * LEVERAGE
 
-exchange = ccxt.kraken({'enableRateLimit': True})
+# Алтын үшін OKX - Bybit пен Kraken сияқты бұғатталмаған
+exchange = ccxt.okx({'enableRateLimit': True})
 active_trade = {"direction": None, "entry": 0, "tp": 0, "be_warned": False}
 
 def get_candles(limit=100):
@@ -105,7 +106,7 @@ def calc_tp(entry, direction):
     return entry * (1 + p) if direction == "LONG" else entry * (1 - p)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("SMC + Orderflow бот қосылды! 📈\n90%+ болса сигнал\nТейк = 50$\nҚарсы жүрсе БУ-ге жап деп ескертем\nТексеру: /check")
+    await update.message.reply_text("XAU + SMC + Orderflow бот қосылды! 📈\n90%+ болса сигнал\nТейк = 50$\nҚарсы жүрсе БУ-ге жап деп ескертем\nТексеру: /check")
 
 async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -114,9 +115,9 @@ async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = get_price()
         if direction and conf >= 90:
             tp = calc_tp(price, direction)
-            msg = f"🚨 {direction} СИГНАЛ!\n\nУверенность: {conf}% 🔥\nКіру: {price}\nТейк (50$): {tp:.2f}\n\nSMC: {smc_text}\nOF: {of_text}"
+            msg = f"🚨 {direction} СИГНАЛ! XAU\n\nУверенность: {conf}% 🔥\nКіру: {price}\nТейк (50$): {tp:.2f}\n\nSMC: {smc_text}\nOF: {of_text}"
         else:
-            msg = f"⚪ Сигнал жоқ\n\nУверенность: {conf}% (керек 90%+)\nБаға: {price}\n\nSMC: {smc_text}\nOF: {of_text}"
+            msg = f"⚪ Сигнал жоқ - XAU\n\nУверенность: {conf}% (керек 90%+)\nБаға: {price}\n\nSMC: {smc_text}\nOF: {of_text}"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Қате: {e}")
@@ -131,7 +132,7 @@ def signal_loop(app):
                     entry = get_price()
                     tp = calc_tp(entry, direction)
                     active_trade.update({"direction": direction, "entry": entry, "tp": tp, "be_warned": False})
-                    text = f"🚨 {direction} СИГНАЛ! Уверенность {conf}% 🔥\n\nКіру: {entry}\nТейк (50$): {tp:.2f}\n\nSMC: {smc_text}\nOF: {of_text}"
+                    text = f"🚨 {direction} СИГНАЛ! XAU Уверенность {conf}% 🔥\n\nКіру: {entry}\nТейк (50$): {tp:.2f}\n\nSMC: {smc_text}\nOF: {of_text}"
                     if CHAT_ID:
                         asyncio.run_coroutine_threadsafe(app.bot.send_message(chat_id=int(CHAT_ID), text=text), asyncio.get_event_loop())
             else:
