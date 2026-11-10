@@ -1,167 +1,229 @@
 import os
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import ccxt
+import numpy as np
+import yfinance as yf
+from flask import Flask
+from threading import Thread
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-def keep_alive():
-    port = int(os.environ.get("PORT", 10000))
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is running!")
-        def log_message(self, format, *args):
-            return
-    server = HTTPServer(('0.0.0.0', port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+TOKEN = os.getenv("BOT_TOKEN")
+app = Flask(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-SYMBOL = "XAUT/USDT"  # АЛТЫН
-TIMEFRAME = "15m"
-DEPOSIT = 100
-LEVERAGE = 10
-TARGET_PROFIT = 50
-POSITION_SIZE = DEPOSIT * LEVERAGE
+@app.route('/')
+def home():
+    return "Gold Bot is alive!"
 
-# Алтын үшін OKX - Bybit пен Kraken сияқты бұғатталмаған
-exchange = ccxt.okx({'enableRateLimit': True})
-active_trade = {"direction": None, "entry": 0, "tp": 0, "be_warned": False}
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
 
-def get_candles(limit=100):
-    return exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=limit)
+# ---------- АЛТЫН ДАННЫЕ ----------
+def get_gold(interval="15m", period="5d"):
+    # GC=F = Gold Futures, XAUUSD-пен бірдей жүреді
+    # interval: 15m, 1h, 4h
+    df = yf.download("GC=F", interval=interval, period=period, progress=False, auto_adjust=True)
+    # yfinance кейде MultiIndex қайтарады, түзетеміз
+    if hasattr(df.columns, 'get_level_values'):
+        try:
+            df.columns = df.columns.get_level_values(0)
+        except:
+            pass
+    highs = df['High'].values.astype(float)
+    lows = df['Low'].values.astype(float)
+    closes = df['Close'].values.astype(float)
+    vols = df['Volume'].values.astype(float)
+    vols = np.nan_to_num(vols, nan=1000)
+    return highs, lows, closes, vols
 
-def get_price():
-    return exchange.fetch_ticker(SYMBOL)['last']
+def volume_profile(highs, lows, closes, vols):
+    p_min, p_max = lows.min(), highs.max()
+    bins = np.linspace(p_min, p_max, 21)
+    vp = np.zeros(20)
+    for i in range(len(closes)):
+        idx = np.digitize(closes[i], bins) - 1
+        idx = max(0, min(19, idx))
+        vp[idx] += vols[i]
+    poc_idx = np.argmax(vp)
+    poc = (bins[poc_idx] + bins[poc_idx+1]) / 2
+    total = vp.sum()
+    sorted_idx = np.argsort(vp)[::-1]
+    cum = 0
+    va = []
+    for idx in sorted_idx:
+        cum += vp[idx]
+        va.append(idx)
+        if cum >= total * 0.7:
+            break
+    vah = bins[max(va)+1]
+    val = bins[min(va)]
+    return poc, vah, val
 
-def check_smc():
-    try:
-        candles = get_candles(100)
-        last_close = candles[-1][4]
-        highs, lows = [], []
-        for i in range(2, len(candles)-2):
-            h, l = candles[i][2], candles[i][3]
-            if h > candles[i-1][2] and h > candles[i-2][2] and h > candles[i+1][2] and h > candles[i+2][2]:
-                highs.append((i, h))
-            if l < candles[i-1][3] and l < candles[i-2][3] and l < candles[i+1][3] and l < candles[i+2][3]:
-                lows.append((i, l))
-        if not highs or not lows:
-            return 0, 0, "SMC: Swing жоқ"
-        last_sh, last_sl = highs[-1][1], lows[-1][1]
-        prev_h = highs[-2][1] if len(highs)>=2 else last_sh
-        prev_l = lows[-2][1] if len(lows)>=2 else last_sl
-        bos_up = last_close > last_sh
-        bos_down = last_close < last_sl
-        sweep_low = min(c[3] for c in candles[-3:]) < prev_l and last_close > prev_l
-        sweep_high = max(c[2] for c in candles[-3:]) > prev_h and last_close < prev_h
-        c1, c3 = candles[-3], candles[-1]
-        fvg_bull = c1[2] < c3[3]
-        fvg_bear = c1[3] > c3[2]
-        long_pts = (30 if bos_up else 0) + (25 if sweep_low else 0) + (20 if fvg_bull else 0)
-        short_pts = (30 if bos_down else 0) + (25 if sweep_high else 0) + (20 if fvg_bear else 0)
-        details = []
-        if bos_up: details.append("BOS UP +30")
-        if bos_down: details.append("BOS DOWN +30")
-        if sweep_low: details.append("Sweep Low +25")
-        if sweep_high: details.append("Sweep High +25")
-        if fvg_bull: details.append("FVG Bull +20")
-        if fvg_bear: details.append("FVG Bear +20")
-        if long_pts > short_pts:
-            return 1, long_pts, " | ".join(details)
-        if short_pts > long_pts:
-            return -1, short_pts, " | ".join(details)
-        return 0, 0, "SMC: Күту"
-    except Exception as e:
-        return 0, 0, f"SMC Қате: {e}"
+def smc_full(highs, lows, closes):
+    price = closes[-1]
+    last_high_50 = highs[-51:-1].max()
+    last_low_50 = lows[-51:-1].min()
+    if price > last_high_50:
+        bias = "LONG BIAS 🟢"
+        structure = "BOS UP"
+    elif price < last_low_50:
+        bias = "SHORT BIAS 🔴"
+        structure = "BOS DOWN"
+    else:
+        bias = "NEUTRAL 🟡"
+        structure = "Рейндж"
 
-def check_orderflow():
-    try:
-        candles = get_candles(30)
-        cvd = sum(c[5] if c[4] > c[1] else -c[5] for c in candles)
-        last5 = sum(c[5] if c[4] > c[1] else -c[5] for c in candles[-5:])
-        avg_vol = sum(c[5] for c in candles[:-1]) / (len(candles)-1)
-        vol_strong = candles[-1][5] > avg_vol * 1.5
-        if cvd > 0 and last5 > 0:
-            return 1, 30 + (15 if vol_strong else 0), f"OF LONG | CVD: {int(cvd)}"
-        if cvd < 0 and last5 < 0:
-            return -1, 30 + (15 if vol_strong else 0), f"OF SHORT | CVD: {int(cvd)}"
-        return 0, 0, f"OF Бейтарап | CVD: {int(cvd)}"
-    except Exception as e:
-        return 0, 0, f"OF Қате: {e}"
+    last_high_20 = highs[-21:-1].max()
+    last_low_20 = lows[-21:-1].min()
+    sweep = "Жоқ"
+    sweep_score = 0
+    if highs[-2] > last_high_20 and closes[-1] < last_high_20:
+        sweep = "SELL SWEEP ⚠️ - Жоғарыдан ликвидность алды"
+        sweep_score = -2
+    elif lows[-2] < last_low_20 and closes[-1] > last_low_20:
+        sweep = "BUY SWEEP ⚠️ - Төменнен ликвидность алды"
+        sweep_score = 2
 
-def analyze():
-    smc_dir, smc_pts, smc_text = check_smc()
-    of_dir, of_pts, of_text = check_orderflow()
-    if smc_dir != 0 and smc_dir == of_dir:
-        confidence = min(100, int((smc_pts / 75 * 55) + (of_pts / 45 * 45)))
-        direction = "LONG" if smc_dir == 1 else "SHORT"
-        return direction, confidence, smc_text, of_text
-    return None, 0, smc_text, of_text
+    fvg = "Жоқ"
+    fvg_price = None
+    if lows[-1] > highs[-3]:
+        fvg = f"Bullish FVG {highs[-3]:.2f} - {lows[-1]:.2f}"
+        fvg_price = (highs[-3] + lows[-1]) / 2
+    elif highs[-1] < lows[-3]:
+        fvg = f"Bearish FVG {lows[-3]:.2f} - {highs[-1]:.2f}"
+        fvg_price = (lows[-3] + highs[-1]) / 2
 
-def calc_tp(entry, direction):
-    p = TARGET_PROFIT / POSITION_SIZE
-    return entry * (1 + p) if direction == "LONG" else entry * (1 - p)
+    if closes[-1] > closes[-5]:
+        ob = f"Bullish OB ~ {lows[-5]:.2f}"
+        ob_price = lows[-5]
+    else:
+        ob = f"Bearish OB ~ {highs[-5]:.2f}"
+        ob_price = highs[-5]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("XAU + SMC + Orderflow бот қосылды! 📈\n90%+ болса сигнал\nТейк = 50$\nҚарсы жүрсе БУ-ге жап деп ескертем\nТексеру: /check")
+    return bias, structure, sweep, sweep_score, fvg, fvg_price, ob, ob_price, last_high_20, last_low_20
 
-async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Тексеріп жатырмын... ⏳")
-        direction, conf, smc_text, of_text = analyze()
-        price = get_price()
-        if direction and conf >= 90:
-            tp = calc_tp(price, direction)
-            msg = f"🚨 {direction} СИГНАЛ! XAU\n\nУверенность: {conf}% 🔥\nКіру: {price}\nТейк (50$): {tp:.2f}\n\nSMC: {smc_text}\nOF: {of_text}"
+def order_flow(closes, vols):
+    delta = 0
+    for i in range(len(closes)-20, len(closes)):
+        if closes[i] > closes[i-1]:
+            delta += vols[i]
         else:
-            msg = f"⚪ Сигнал жоқ - XAU\n\nУверенность: {conf}% (керек 90%+)\nБаға: {price}\n\nSMC: {smc_text}\nOF: {of_text}"
+            delta -= vols[i]
+    avg_vol = vols[-50:].mean()
+    last_vol = vols[-1]
+    vol_status = "Күшті ✅" if last_vol > avg_vol * 1.2 else "Әлсіз ⚠️"
+    return delta, vol_status
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ XAU/USD (АЛТЫН) - 6 STEP-пен анализ жасап жатырмын...")
+
+    try:
+        h15, l15, c15, v15 = get_gold("15m", "5d")
+        h4, l4, c4, v4 = get_gold("60m", "1mo")
+        price = c15[-1]
+
+        bias, structure, sweep, sweep_score, fvg, fvg_price, ob, ob_price, lh20, ll20 = smc_full(h15, l15, c15)
+        bias4, _, _, _, _, _, _, _, _, _ = smc_full(h4, l4, c4)
+        poc, vah, val = volume_profile(h15, l15, c15, v15)
+        delta, vol_status = order_flow(c15, v15)
+
+        score = 0
+        checklist = []
+        if "LONG" in bias:
+            score += 1
+            checklist.append("✅ 1. Бағыт: LONG (BOS UP)")
+        elif "SHORT" in bias:
+            score -= 1
+            checklist.append("🔻 1. Бағыт: SHORT (BOS DOWN)")
+        else:
+            checklist.append("🟡 1. Бағыт: Рейндж")
+
+        if sweep_score == 2:
+            score += 2
+            checklist.append("✅ 2. Sweep: BUY SWEEP болды")
+        elif sweep_score == -2:
+            score -= 2
+            checklist.append("🔻 2. Sweep: SELL SWEEP болды")
+        else:
+            checklist.append("🟡 2. Sweep: Жоқ - күт")
+
+        if price > poc:
+            score += 1
+            checklist.append(f"✅ 3. Баға POC ({poc:.2f})-тан жоғары")
+        else:
+            score -= 1
+            checklist.append(f"🔻 3. Баға POC ({poc:.2f})-тан төмен")
+
+        if delta > 0:
+            score += 2
+            checklist.append(f"✅ 4. Order Flow Delta + - Алушылар күшті")
+        else:
+            score -= 2
+            checklist.append(f"🔻 4. Order Flow Delta - - Сатушылар күшті")
+
+        if fvg_price is not None:
+            checklist.append(f"✅ 5. FVG бар: {fvg}")
+            score += 1 if "Bullish" in fvg else -1
+
+        if score >= 4:
+            signal = "🟢 LONG / BUY - КІРУГЕ БОЛАДЫ"
+            entry = ob_price
+            sl = ll20 * 0.999
+            tp1, tp2, tp3 = poc, vah, lh20
+        elif score <= -4:
+            signal = "🔴 SHORT / SELL - КІРУГЕ БОЛАДЫ"
+            entry = ob_price
+            sl = lh20 * 1.001
+            tp1, tp2, tp3 = poc, val, ll20
+        else:
+            signal = "🟡 КҮТ - Кірме!"
+            entry, sl, tp1, tp2, tp3 = price, price, price, price, price
+
+        msg = f"""🥇 **XAU/USD | АЛТЫН | 15m + 1H**
+
+💰 Баға: {price:.2f} $
+
+**STEP 1 - БАҒЫТ:**
+15m: {bias} - {structure}
+1H: {bias4}
+
+**STEP 2 - LIQUIDITY:**
+{sweep}
+High: {lh20:.2f} | Low: {ll20:.2f}
+
+**STEP 3 - VOLUME PROFILE:**
+POC: {poc:.2f} | VAH: {vah:.2f} | VAL: {val:.2f}
+
+**STEP 4 - ORDER FLOW:**
+Delta: {'+' if delta>0 else ''}{delta:.0f}
+Volume: {vol_status}
+
+**STEP 5 - ENTRY ZONE:**
+FVG: {fvg}
+OB: {ob}
+
+**✅ ЧЕК-ЛИСТ:**
+{chr(10).join(checklist)}
+
+**STEP 6 - ШЕШІМ:**
+{signal}
+Score: {score}/7
+
+🎯 Entry: {entry:.2f}
+🛑 SL: {sl:.2f}
+✅ TP1: {tp1:.2f} (POC)
+✅ TP2: {tp2:.2f} (VAH/VAL)
+✅ TP3: {tp3:.2f} (Liquidity)
+"""
         await update.message.reply_text(msg)
     except Exception as e:
-        await update.message.reply_text(f"Қате: {e}")
+        await update.message.reply_text(f"Қате: {e}\nАлтын данныесі кешігіп жатыр, 1 минуттан соң қайта /check деп жаз")
 
-def signal_loop(app):
-    import asyncio
-    while True:
-        try:
-            if active_trade["direction"] is None:
-                direction, conf, smc_text, of_text = analyze()
-                if direction and conf >= 90:
-                    entry = get_price()
-                    tp = calc_tp(entry, direction)
-                    active_trade.update({"direction": direction, "entry": entry, "tp": tp, "be_warned": False})
-                    text = f"🚨 {direction} СИГНАЛ! XAU Уверенность {conf}% 🔥\n\nКіру: {entry}\nТейк (50$): {tp:.2f}\n\nSMC: {smc_text}\nOF: {of_text}"
-                    if CHAT_ID:
-                        asyncio.run_coroutine_threadsafe(app.bot.send_message(chat_id=int(CHAT_ID), text=text), asyncio.get_event_loop())
-            else:
-                price = get_price()
-                d = active_trade["direction"]; entry = active_trade["entry"]; tp = active_trade["tp"]
-                if (d == "LONG" and price >= tp) or (d == "SHORT" and price <= tp):
-                    text = f"✅ ТЕЙК АЛЫНДЫ! +50$ 🎉\n{d} | Кіру: {entry} | Шығу: {price}"
-                    if CHAT_ID:
-                        asyncio.run_coroutine_threadsafe(app.bot.send_message(chat_id=int(CHAT_ID), text=text), asyncio.get_event_loop())
-                    active_trade.update({"direction": None, "entry": 0, "tp": 0, "be_warned": False})
-                elif not active_trade["be_warned"]:
-                    pnl = (price - entry) / entry * 100 if d == "LONG" else (entry - price) / entry * 100
-                    if pnl <= -0.3:
-                        text = f"⚠️ БУ-ГЕ ЖАП!\n\n{d} | Кіру: {entry}\nҚазір: {price} ({pnl:.2f}%)\nБаға қарсы кетті!"
-                        if CHAT_ID:
-                            asyncio.run_coroutine_threadsafe(app.bot.send_message(chat_id=int(CHAT_ID), text=text), asyncio.get_event_loop())
-                        active_trade.update({"direction": None, "entry": 0, "tp": 0, "be_warned": False})
-        except Exception as e:
-            print(f"Loop қате: {e}")
-        time.sleep(60)
-
-def main():
-    keep_alive()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check_now))
-    threading.Thread(target=signal_loop, args=(app,), daemon=True).start()
-    print("Бот іске қосылды...")
-    app.run_polling()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Алтын бот дайын! 🥇\n/check деп жаз")
 
 if __name__ == "__main__":
-    main()
+    Thread(target=run_flask, daemon=True).start()
+    app_bot = ApplicationBuilder().token(TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("check", check))
+    print("Gold Bot started...")
+    app_bot.run_polling()
