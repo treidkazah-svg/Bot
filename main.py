@@ -1,127 +1,254 @@
-import os, threading, requests, time, random
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+import requests
+import numpy as np
+from flask import Flask
+from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TOKEN = os.getenv("BOT_TOKEN")
+app = Flask(__name__)
 
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"BOT LIVE")
-    def do_HEAD(self):
-        self.send_response(200); self.end_headers()
-    def log_message(self, *a): return
+@app.route('/')
+def home():
+    return "Bot is alive! GOLD"
 
-def run_web():
-    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), H).serve_forever()
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
 
-def get_price():
-    try:
-        r = requests.get("https://data-asg.goldprice.org/dbXRates/USD", timeout=10).json()
-        return float(r['items'][0]['curr']) / 31.1035
-    except:
-        return 4071.0
+# ---------- АЛТЫНҒА МАППИНГ ----------
+# Сен /check XAUUSD деп жазсаң, бот Binance-тен PAXGUSDT алады
+SYMBOL_MAP = {
+    "XAUUSD": "PAXGUSDT",
+    "GOLD": "PAXGUSDT",
+    "XAU": "PAXGUSDT",
+    "PAXG": "PAXGUSDT",
+}
 
-def full_analiz():
-    p = get_price()
-    # Сенің ескі логикаң - STEP 1-6
-    # Мысал: бағаға қарап бағыт шығарамыз
-    direction = "SHORT" if random.random() > 0.5 else "LONG"
-    score = "-5/7" if direction == "SHORT" else "5/7"
-    bias = "SHORT BIAS 🔴 - BOS DOWN" if direction == "SHORT" else "LONG BIAS 🟢 - BOS UP"
+def get_klines(symbol, interval, limit=200):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    r = requests.get(url, timeout=10).json()
+    highs = np.array([float(x[2]) for x in r])
+    lows = np.array([float(x[3]) for x in r])
+    closes = np.array([float(x[4]) for x in r])
+    vols = np.array([float(x[5]) for x in r])
+    return highs, lows, closes, vols
 
-    high = p + 25
-    low = p - 30
-    poc = p + 59
-    vah = p + 68
-    val = p - 18
+# ---------- STEP 3: VOLUME PROFILE ----------
+def volume_profile(highs, lows, closes, vols):
+    p_min, p_max = lows.min(), highs.max()
+    bins = np.linspace(p_min, p_max, 21)
+    vp = np.zeros(20)
+    for i in range(len(closes)):
+        idx = np.digitize(closes[i], bins) - 1
+        idx = max(0, min(19, idx))
+        vp[idx] += vols[i]
+    poc_idx = np.argmax(vp)
+    poc = (bins[poc_idx] + bins[poc_idx+1]) / 2
+    total = vp.sum()
+    sorted_idx = np.argsort(vp)[::-1]
+    cum = 0
+    va = []
+    for idx in sorted_idx:
+        cum += vp[idx]
+        va.append(idx)
+        if cum >= total * 0.7:
+            break
+    vah = bins[max(va)+1]
+    val = bins[min(va)]
+    return poc, vah, val
 
-    if direction == "SHORT":
-        entry_market = p
-        entry_limit = p + 5.0  # OB зонасы
-        sl = p + 30
-        tp1 = poc
-        tp2 = val
-        tp3 = low
-        fvg = f"Bearish FVG {p-15:.2f} - {p-17:.2f}"
-        ob = f"Bearish OB ~ {entry_limit:.2f}"
+# ---------- STEP 1,2,5: SMC ----------
+def smc_full(highs, lows, closes):
+    price = closes[-1]
+    last_high_50 = highs[-51:-1].max()
+    last_low_50 = lows[-51:-1].min()
+    if price > last_high_50:
+        bias = "LONG BIAS 🟢"
+        structure = "BOS UP - Тренд жоғары"
+    elif price < last_low_50:
+        bias = "SHORT BIAS 🔴"
+        structure = "BOS DOWN - Тренд төмен"
     else:
-        entry_market = p
-        entry_limit = p - 5.0
-        sl = p - 30
-        tp1 = poc
-        tp2 = vah
-        tp3 = high
-        fvg = f"Bullish FVG {p+15:.2f} - {p+17:.2f}"
-        ob = f"Bullish OB ~ {entry_limit:.2f}"
+        bias = "NEUTRAL 🟡"
+        structure = "Рейндж - Тренд жоқ"
 
-    msg = f"""**XAUUSD | АЛТЫН | 15m + 1H**
+    last_high_20 = highs[-21:-1].max()
+    last_low_20 = lows[-21:-1].min()
+    sweep = "Жоқ"
+    sweep_score = 0
+    if highs[-2] > last_high_20 and closes[-1] < last_high_20:
+        sweep = "SELL SWEEP ⚠️ - Жоғарыдан ликвидность алды, түсу мүмкін"
+        sweep_score = -2
+    elif lows[-2] < last_low_20 and closes[-1] > last_low_20:
+        sweep = "BUY SWEEP ⚠️ - Төменнен ликвидность алды, өсу мүмкін"
+        sweep_score = 2
 
-**STEP 1 - BAI BIT:**
-15m: {bias}
-1H: NEUTRAL 🟡
+    fvg = "Жоқ"
+    fvg_price = None
+    if lows[-1] > highs[-3]:
+        fvg = f"Bullish FVG {highs[-3]:.2f} - {lows[-1]:.2f}"
+        fvg_price = (highs[-3] + lows[-1]) / 2
+    elif highs[-1] < lows[-3]:
+        fvg = f"Bearish FVG {lows[-3]:.2f} - {highs[-1]:.2f}"
+        fvg_price = (lows[-3] + highs[-1]) / 2
+
+    if closes[-1] > closes[-5]:
+        ob = f"Bullish OB ~ {lows[-5]:.2f}"
+        ob_price = lows[-5]
+    else:
+        ob = f"Bearish OB ~ {highs[-5]:.2f}"
+        ob_price = highs[-5]
+
+    return bias, structure, sweep, sweep_score, fvg, fvg_price, ob, ob_price, last_high_20, last_low_20
+
+# ---------- STEP 4: ORDER FLOW ----------
+def order_flow(closes, vols):
+    delta_recent = 0
+    for i in range(len(closes)-20, len(closes)):
+        if closes[i] > closes[i-1]:
+            delta_recent += vols[i]
+        else:
+            delta_recent -= vols[i]
+    avg_vol = vols[-50:].mean()
+    last_vol = vols[-1]
+    vol_status = "Күшті ✅" if last_vol > avg_vol * 1.2 else "Әлсіз ⚠️"
+    return delta_recent, vol_status, last_vol, avg_vol
+
+# ---------- ГЛАВНЫЙ /check ----------
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Әдепкі - АЛТЫН
+    user_symbol = "XAUUSD"
+    if context.args:
+        user_symbol = context.args[0].upper()
+
+    # Алтынды PAXG-ге айналдырамыз
+    binance_symbol = SYMBOL_MAP.get(user_symbol, user_symbol)
+    if "USDT" not in binance_symbol:
+        binance_symbol += "USDT"
+
+    display_symbol = "XAUUSD (GOLD) 🥇" if binance_symbol == "PAXGUSDT" else user_symbol
+
+    await update.message.reply_text(f"⏳ {display_symbol} - 6 STEP-пен анализ жасап жатырмын...")
+
+    try:
+        h15, l15, c15, v15 = get_klines(binance_symbol, "15m", 200)
+        h4, l4, c4, v4 = get_klines(binance_symbol, "4h", 100)
+        price = c15[-1]
+
+        bias, structure, sweep, sweep_score, fvg, fvg_price, ob, ob_price, lh20, ll20 = smc_full(h15, l15, c15)
+        bias4, _, _, _, _, _, _, _, _, _ = smc_full(h4, l4, c4)
+        poc, vah, val = volume_profile(h15, l15, c15, v15)
+        delta, vol_status, last_vol, avg_vol = order_flow(c15, v15)
+
+        score = 0
+        checklist = []
+        if "LONG" in bias:
+            score += 1
+            checklist.append("✅ 1. Бағыт: LONG (BOS UP)")
+        elif "SHORT" in bias:
+            score -= 1
+            checklist.append("🔻 1. Бағыт: SHORT (BOS DOWN)")
+        else:
+            checklist.append("🟡 1. Бағыт: Рейндж")
+
+        if sweep_score == 2:
+            score += 2
+            checklist.append("✅ 2. Sweep: BUY SWEEP болды")
+        elif sweep_score == -2:
+            score -= 2
+            checklist.append("🔻 2. Sweep: SELL SWEEP болды")
+        else:
+            checklist.append("🟡 2. Sweep: Жоқ - күт")
+
+        if price > poc:
+            score += 1
+            checklist.append(f"✅ 3. Баға POC ({poc:.2f})-тан жоғары")
+        else:
+            score -= 1
+            checklist.append(f"🔻 3. Баға POC ({poc:.2f})-тан төмен")
+
+        if delta > 0:
+            score += 2
+            checklist.append(f"✅ 4. Order Flow Delta + {delta:.0f} - Алушылар күшті")
+        else:
+            score -= 2
+            checklist.append(f"🔻 4. Order Flow Delta {delta:.0f} - Сатушылар күшті")
+
+        if fvg_price is not None:
+            checklist.append(f"✅ 5. FVG бар: {fvg}")
+            score += 1 if "Bullish" in fvg else -1
+
+        # АЛТЫН ҮШІН SL КЕҢІРЕК - алтын тез жүреді, 0.999 тым тар
+        if score >= 4:
+            signal = "🟢 LONG / BUY - КІРУГЕ БОЛАДЫ"
+            entry = ob_price if "Bullish" in ob else fvg_price if fvg_price else price
+            sl = ll20 - 3  # Алтынға -3$ SL
+            tp1 = poc
+            tp2 = vah
+            tp3 = lh20
+        elif score <= -4:
+            signal = "🔴 SHORT / SELL - КІРУГЕ БОЛАДЫ"
+            entry = ob_price if "Bearish" in ob else fvg_price if fvg_price else price
+            sl = lh20 + 3  # Алтынға +3$ SL
+            tp1 = poc
+            tp2 = val
+            tp3 = ll20
+        else:
+            signal = "🟡 КҮТ - Кірме! 4/5 шарт орындалмады"
+            entry = price
+            sl = price
+            tp1 = price
+            tp2 = price
+            tp3 = price
+
+        msg = f"""📊 **{display_symbol} | 15m + 4H**
+
+💰 Баға: {price:.2f} $
+
+**STEP 1 - БАҒЫТ:**
+15m: {bias} - {structure}
+4H: {bias4}
 
 **STEP 2 - LIQUIDITY:**
-Жоқ
-High: {high:.2f} | Low: {low:.2f}
+{sweep}
+Соңғы High: {lh20:.2f} | Low: {ll20:.2f}
 
 **STEP 3 - VOLUME PROFILE:**
 POC: {poc:.2f} | VAH: {vah:.2f} | VAL: {val:.2f}
 
 **STEP 4 - ORDER FLOW:**
-Delta: -29299
-Volume: Күшті ✅
+Delta (20 свеча): {delta:.0f}
+Volume: {vol_status}
 
 **STEP 5 - ENTRY ZONE:**
 FVG: {fvg}
 OB: {ob}
 
 **✅ ЧЕК-ЛИСТ:**
-1. Бағыт: {direction}
-2. Sweep: Жоқ - күт
-3. Баға POC ({poc:.2f})-тан төмен
-4. Order Flow Delta - Сатушылар күшті
-5. FVG бар: {fvg}
+{chr(10).join(checklist)}
 
 **STEP 6 - ШЕШІМ:**
-{'🔴' if direction=='SHORT' else '🟢'} {direction} / {'SELL' if direction=='SHORT' else 'BUY'} - КІРУГЕ БОЛАДЫ
-Score: {score}
+{signal}
+Score: {score}/7
 
-🎯 Entry: {entry_market:.2f}
+🎯 Entry: {entry:.2f}
 🛑 SL: {sl:.2f}
 ✅ TP1: {tp1:.2f} (POC)
 ✅ TP2: {tp2:.2f} (VAH/VAL)
 ✅ TP3: {tp3:.2f} (Liquidity)
-
----
-🔥 MARKETPEN KIR:
-Baga: {entry_market:.2f} Lot: 0.02 TP: {tp1:.2f} SL: {sl:.2f}
-👉 Qazir birden kir!
-
-🔥 LIMITPEN KIR:
-Baga: {entry_limit:.2f} Lot: 0.02 TP: {tp2:.2f} SL: {sl:.2f}
-👉 Baga osy jerge kelgende kir!
 """
-    return msg
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Қате: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ BOT QOSYLDY!\n\n/check - Analiz alu")
-
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(full_analiz())
-
-async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(full_analiz())
-
-def main():
-    threading.Thread(target=run_web, daemon=True).start()
-    print("BOT START...")
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check))
-    app.add_handler(CommandHandler("analiz", analiz))
-    app.run_polling()
+    await update.message.reply_text("Алтын бот дайын! 🥇\n/check XAUUSD деп жаз\n6 STEP: Price Action + SMC + Order Flow + VP")
 
 if __name__ == "__main__":
-    main()
+    Thread(target=run_flask, daemon=True).start()
+    app_bot = ApplicationBuilder().token(TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("check", check))
+    print("Gold Bot started...")
+    app_bot.run_polling()
